@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use axiom_ai_core::{Message, Memory, InMemoryMemory, Tool, ToolResult, ToolParameters, ToolParameter, ParameterType};
+use axiom_ai_core::{AxiomError, Message, InMemoryMemory, Tool, ToolResult, ToolParameters, ToolParameter, ParameterType};
 use axiom_ai_llm::{LlmGateway, OpenAIProvider, ProviderConfig};
-use axiom_ai_agents::{Agent, AgentConfig, SimplePlanner, SimpleExecutor, SimpleSafetyGuard};
+use axiom_ai_agents::{Agent, AgentConfig, SimplePlanner, SimpleSafetyGuard};
 
 /// Example of a basic agent
 pub async fn run_basic_agent_example() -> anyhow::Result<()> {
@@ -27,9 +27,6 @@ pub async fn run_basic_agent_example() -> anyhow::Result<()> {
     // Create planner
     let planner = Box::new(SimplePlanner::new(10));
 
-    // Create executor
-    let executor = Box::new(SimpleExecutor::new(llm_gateway.clone(), "gpt-3.5-turbo".to_string()));
-
     // Create safety guard
     let safety_guard = Box::new(SimpleSafetyGuard::new());
 
@@ -41,7 +38,6 @@ pub async fn run_basic_agent_example() -> anyhow::Result<()> {
         llm_gateway,
         memory,
         planner,
-        executor,
         safety_guard,
         config,
     );
@@ -51,9 +47,11 @@ pub async fn run_basic_agent_example() -> anyhow::Result<()> {
 
     // Process a message
     let message = Message::user("What is 2 + 2?");
-    let result = agent.process_message(message).await?;
+    let outcome = agent.process_message(message).await?;
 
-    println!("Agent response: {:?}", result);
+    if let Some(reply) = outcome.messages.last().and_then(|m| m.text_content()) {
+        println!("Agent response: {}", reply);
+    }
 
     Ok(())
 }
@@ -85,10 +83,10 @@ impl Tool for CalculatorTool {
             ).required())
     }
 
-    async fn execute(&self, arguments: std::collections::HashMap<String, serde_json::Value>) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute(&self, arguments: std::collections::HashMap<String, serde_json::Value>) -> axiom_ai_core::Result<ToolResult> {
         let expression = arguments.get("expression")
             .and_then(|v| v.as_str())
-            .ok_or("Missing expression parameter")?;
+            .ok_or_else(|| AxiomError::ToolExecution("Missing expression parameter".to_string()))?;
 
         // Simple evaluation (in production, use a proper math parser)
         let result = match expression {

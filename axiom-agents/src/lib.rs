@@ -8,22 +8,22 @@
 
 pub mod agent;
 pub mod planner;
-pub mod executor;
 pub mod safety;
 pub mod tools;
+pub mod turn;
 
 pub use agent::*;
 pub use planner::*;
-pub use executor::*;
 pub use safety::*;
 pub use tools::*;
+pub use turn::*;
 
 /// Re-exports commonly used types for convenience
 pub mod prelude {
     pub use crate::{
-        Agent, AgentConfig, AgentState, AgentResult,
+        Agent, AgentConfig, AgentState,
         Planner, ExecutionPlan, PlanStep,
-        Executor, ExecutionContext,
+        TurnOutcome, StopReason,
         SafetyGuard, SafetyResult,
     };
     pub use axiom_ai_core::prelude::*;

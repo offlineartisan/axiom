@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-use axiom_ai_core::{Message, Result, AxiomError, MemoryType};
+use axiom_ai_core::{Result, AxiomError, MemoryType, ParameterType};
 // Types are defined in this module
 use crate::agent::{PlanningRequest, ToolInfo};
 
@@ -119,21 +119,19 @@ impl Planner for SimplePlanner {
             step_counter += 1;
         }
 
-        // Always generate a response
+        // Limit the number of steps, keeping room for the response
+        steps.truncate(self.max_steps.saturating_sub(1));
+
+        // Always generate a response, after everything else
         steps.push(PlanStep {
             id: format!("generate_response_{}", step_counter),
             action: PlanAction::GenerateResponse {
                 prompt: last_message.to_string(),
             },
-            dependencies: (0..step_counter).map(|i| format!("retrieve_memory_{}", i)).collect(),
+            dependencies: steps.iter().map(|step| step.id.clone()).collect(),
             estimated_time_ms: 2000,
             priority: 3,
         });
-
-        // Limit the number of steps
-        if steps.len() > self.max_steps {
-            steps.truncate(self.max_steps);
-        }
 
         // Calculate total estimated time
         let estimated_time = steps.iter().map(|s| s.estimated_time_ms).sum();
@@ -159,10 +157,14 @@ impl SimplePlanner {
         let message_lower = message.to_lowercase();
 
         for tool in available_tools {
-            if self.should_call_tool(&message_lower, tool) {
+            if !self.should_call_tool(&message_lower, tool) {
+                continue;
+            }
+            // A call whose required arguments can't be filled would be rejected; skip it
+            if let Some(arguments) = self.extract_tool_arguments(message, tool) {
                 tool_calls.push(ToolCall {
                     tool_name: tool.name.clone(),
-                    arguments: self.extract_tool_arguments(message, tool),
+                    arguments,
                 });
             }
         }
@@ -175,40 +177,38 @@ impl SimplePlanner {
         let tool_name_lower = tool.name.to_lowercase();
         let description_lower = tool.description.to_lowercase();
 
-        // Simple keyword matching
-        message.contains(&tool_name_lower) ||
-        message.contains("search") && description_lower.contains("search") ||
-        message.contains("calculate") && description_lower.contains("calculate") ||
-        message.contains("weather") && description_lower.contains("weather") ||
-        message.contains("time") && description_lower.contains("time")
+        // Simple keyword matching; stems so "calculate" matches "calculations"
+        message.contains(&tool_name_lower)
+            || ["search", "calculat", "weather", "time"]
+                .iter()
+                .any(|stem| message.contains(stem) && description_lower.contains(stem))
     }
 
-    /// Extract arguments for a tool call
-    fn extract_tool_arguments(&self, message: &str, tool: &ToolInfo) -> HashMap<String, serde_json::Value> {
+    /// Fill the tool's required arguments from the message.
+    ///
+    /// Arguments are chosen by the tool's parameter schema: `expression` gets the math in the
+    /// message, `location` the place after "in", and any other string parameter the whole
+    /// message. Returns `None` when a required argument can't be filled this way.
+    fn extract_tool_arguments(&self, message: &str, tool: &ToolInfo) -> Option<HashMap<String, serde_json::Value>> {
         let mut arguments = HashMap::new();
 
-        // Simple argument extraction based on tool name
-        match tool.name.as_str() {
-            "search" => {
-                arguments.insert("query".to_string(), serde_json::Value::String(message.to_string()));
+        for name in tool.parameters.required_names() {
+            let param = tool.parameters.properties.get(&name)?;
+            if param.parameter_type != ParameterType::String {
+                return None;
             }
-            "calculate" => {
-                // Extract mathematical expression
-                let expr = self.extract_math_expression(message);
-                arguments.insert("expression".to_string(), serde_json::Value::String(expr));
+            let value = match name.as_str() {
+                "expression" => self.extract_math_expression(message),
+                "location" => self.extract_location(message),
+                _ => message.to_string(),
+            };
+            if value.is_empty() {
+                return None;
             }
-            "weather" => {
-                // Extract location
-                let location = self.extract_location(message);
-                arguments.insert("location".to_string(), serde_json::Value::String(location));
-            }
-            _ => {
-                // Default: pass the entire message
-                arguments.insert("input".to_string(), serde_json::Value::String(message.to_string()));
-            }
+            arguments.insert(name, serde_json::Value::String(value));
         }
 
-        arguments
+        Some(arguments)
     }
 
     /// Extract mathematical expression from message
@@ -323,14 +323,21 @@ impl LLMPlanner {
             ));
         }
         
-        prompt.push_str("\nAvailable tools:\n");
+        prompt.push_str("\nAvailable tools (arguments as JSON Schema):\n");
         for tool in &request.available_tools {
-            prompt.push_str(&format!("- {}: {}\n", tool.name, tool.description));
+            prompt.push_str(&format!(
+                "- {}: {}\n  arguments: {}\n",
+                tool.name,
+                tool.description,
+                tool.parameters.to_json_schema()
+            ));
         }
         
         prompt.push_str("\nCreate a step-by-step execution plan. Each step should be in the format:\n");
         prompt.push_str("STEP: <action_type> | <parameters> | <dependencies>\n");
         prompt.push_str("Available actions: generate_response, call_tool, update_memory, retrieve_memory\n");
+        prompt.push_str("For call_tool, <parameters> is the tool name followed by its arguments as one JSON object, e.g.\n");
+        prompt.push_str("STEP: call_tool | calculator {\"expression\": \"2 + 2\"} |\n");
         
         prompt
     }
@@ -400,17 +407,20 @@ impl LLMPlanner {
                 })
             }
             "call_tool" => {
-                let tool_name = params.split_whitespace().next()
-                    .ok_or_else(|| AxiomError::ChainExecution("Missing tool name".to_string()))?;
+                let params = params.trim();
+                let (tool_name, raw_arguments) = params
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((params, ""));
+                if tool_name.is_empty() {
+                    return Err(AxiomError::ChainExecution("Missing tool name".to_string()));
+                }
                 
                 // Find the tool in available tools
                 let tool = request.available_tools.iter()
                     .find(|t| t.name == tool_name)
                     .ok_or_else(|| AxiomError::ChainExecution(format!("Tool not found: {}", tool_name)))?;
                 
-                // Extract arguments (simplified)
-                let mut arguments = HashMap::new();
-                arguments.insert("input".to_string(), serde_json::Value::String(params.to_string()));
+                let arguments = parse_tool_arguments(tool, raw_arguments.trim())?;
                 
                 Ok(PlanAction::CallTool {
                     tool_name: tool_name.to_string(),
@@ -433,5 +443,175 @@ impl LLMPlanner {
                 Err(AxiomError::ChainExecution(format!("Unknown action type: {}", action_type)))
             }
         }
+    }
+}
+
+/// Arguments for `tool` from the text after its name in a `call_tool` step.
+///
+/// The text is a JSON object of arguments. As a fallback, plain text is accepted for a tool
+/// with exactly one required string parameter, and empty text for a tool with no required
+/// parameters.
+fn parse_tool_arguments(tool: &ToolInfo, text: &str) -> Result<HashMap<String, serde_json::Value>> {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(text) {
+        return Ok(map.into_iter().collect());
+    }
+
+    let required = tool.parameters.required_names();
+    match required.as_slice() {
+        [] if text.is_empty() => Ok(HashMap::new()),
+        [name]
+            if tool
+                .parameters
+                .properties
+                .get(name)
+                .map_or(false, |param| param.parameter_type == ParameterType::String) =>
+        {
+            Ok(HashMap::from([(name.clone(), serde_json::Value::String(text.to_string()))]))
+        }
+        _ => Err(AxiomError::ChainExecution(format!(
+            "Arguments for tool '{}' must be a JSON object, got: {}",
+            tool.name, text
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axiom_ai_core::{Message, Tool};
+    use axiom_ai_llm::LlmGateway;
+
+    use super::*;
+    use crate::agent::AgentConfig;
+    use crate::tools::{CalculatorTool, FileTool, SearchTool, TimeTool, WeatherTool};
+
+    fn info(tool: &dyn Tool) -> ToolInfo {
+        ToolInfo {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            parameters: tool.parameters(),
+        }
+    }
+
+    fn request(message: &str, tools: &[&dyn Tool]) -> PlanningRequest {
+        PlanningRequest {
+            conversation: vec![Message::user(message)],
+            // Non-empty context so the planner doesn't add a memory step
+            context: vec![axiom_ai_core::MemoryItem::new("seen", MemoryType::ShortTerm, 0.5)],
+            available_tools: tools.iter().map(|tool| info(*tool)).collect(),
+            config: AgentConfig::default(),
+        }
+    }
+
+    fn tool_calls(plan: &ExecutionPlan) -> Vec<(&str, &HashMap<String, serde_json::Value>)> {
+        plan.steps
+            .iter()
+            .filter_map(|step| match &step.action {
+                PlanAction::CallTool { tool_name, arguments } => Some((tool_name.as_str(), arguments)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn simple_planner_fills_calculator_expression_that_validates() {
+        let calculator = CalculatorTool::new();
+        let plan = SimplePlanner::new(5)
+            .create_plan(request("please calculate 2 + 2", &[&calculator]))
+            .await
+            .unwrap();
+
+        let calls = tool_calls(&plan);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "calculator");
+        assert_eq!(calls[0].1["expression"], "2 + 2");
+        calculator.validate_arguments(calls[0].1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn simple_planner_arguments_validate_for_each_matched_builtin() {
+        let search = SearchTool::new(None);
+        let weather = WeatherTool::new(None);
+        let time = TimeTool::new();
+        let tools: [&dyn Tool; 3] = [&search, &weather, &time];
+        let plan = SimplePlanner::new(10)
+            .create_plan(request("search the weather in Oslo at this time", &tools))
+            .await
+            .unwrap();
+
+        let calls = tool_calls(&plan);
+        assert_eq!(calls.len(), 3);
+        for (name, arguments) in calls {
+            let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
+            tool.validate_arguments(arguments)
+                .unwrap_or_else(|e| panic!("{name} arguments rejected: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_planner_skips_tool_whose_required_arguments_it_cannot_fill() {
+        let file = FileTool::new();
+        let plan = SimplePlanner::new(5)
+            .create_plan(request("read the file", &[&file]))
+            .await
+            .unwrap();
+
+        assert!(tool_calls(&plan).is_empty());
+    }
+
+    #[tokio::test]
+    async fn simple_planner_keeps_response_step_last_when_truncating() {
+        let search = SearchTool::new(None);
+        let time = TimeTool::new();
+        let plan = SimplePlanner::new(2)
+            .create_plan(request("search what time it is", &[&search, &time]))
+            .await
+            .unwrap();
+
+        assert_eq!(plan.steps.len(), 2);
+        let last = plan.steps.last().unwrap();
+        assert!(matches!(last.action, PlanAction::GenerateResponse { .. }));
+        assert_eq!(last.dependencies, vec![plan.steps[0].id.clone()]);
+    }
+
+    fn llm_planner() -> LLMPlanner {
+        LLMPlanner::new(Arc::new(LlmGateway::new("none")), "model".to_string())
+    }
+
+    #[test]
+    fn llm_planner_parses_json_tool_arguments() {
+        let calculator = CalculatorTool::new();
+        let plan = llm_planner()
+            .parse_plan_response(
+                "STEP: call_tool | calculator {\"expression\": \"2 + 2\"} |\nSTEP: generate_response | answer |",
+                &request("", &[&calculator]),
+            )
+            .unwrap();
+
+        let calls = tool_calls(&plan);
+        assert_eq!(calls[0].1["expression"], "2 + 2");
+        calculator.validate_arguments(calls[0].1).unwrap();
+    }
+
+    #[test]
+    fn llm_planner_maps_plain_text_to_single_required_string_parameter() {
+        let search = SearchTool::new(None);
+        let plan = llm_planner()
+            .parse_plan_response("STEP: call_tool | search rust async traits |", &request("", &[&search]))
+            .unwrap();
+
+        let calls = tool_calls(&plan);
+        assert_eq!(calls[0].1["query"], "rust async traits");
+        search.validate_arguments(calls[0].1).unwrap();
+    }
+
+    #[test]
+    fn llm_planner_rejects_plain_text_for_multi_argument_tool() {
+        let file = FileTool::new();
+        let result = llm_planner()
+            .parse_plan_response("STEP: call_tool | file read notes.txt |", &request("", &[&file]));
+
+        assert!(result.is_err());
     }
 }

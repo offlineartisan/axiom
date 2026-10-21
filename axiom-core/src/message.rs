@@ -87,11 +87,33 @@ impl Message {
         Self::new(MessageRole::Assistant, MessageContent::Text(text.into()))
     }
 
-    /// Create a tool message
-    pub fn tool(_tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    /// Create a tool message carrying the result of the tool call `tool_call_id`
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self::new(
             MessageRole::Tool,
-            MessageContent::Text(content.into()),
+            MessageContent::Parts(vec![MessagePart::ToolResult {
+                tool_call_id: tool_call_id.into(),
+                content: content.into(),
+            }]),
+        )
+    }
+
+    /// Create an assistant message that requests one tool call.
+    ///
+    /// Providers require a tool result to follow the assistant message that issued the
+    /// call, so pair this with [`Message::tool`] using the same `id`.
+    pub fn tool_call(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Self::new(
+            MessageRole::Assistant,
+            MessageContent::Parts(vec![MessagePart::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+            }]),
         )
     }
 
@@ -101,7 +123,7 @@ impl Message {
         self
     }
 
-    /// Get the text content if this is a text message
+    /// Get the text content if this is a text message or a single tool result
     pub fn text_content(&self) -> Option<&str> {
         match &self.content {
             MessageContent::Text(text) => Some(text),
@@ -109,6 +131,7 @@ impl Message {
                 if parts.len() == 1 {
                     match &parts[0] {
                         MessagePart::Text(text) => Some(text),
+                        MessagePart::ToolResult { content, .. } => Some(content),
                         _ => None,
                     }
                 } else {
