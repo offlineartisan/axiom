@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-use axiom_ai_core::{Result, AxiomError};
+use axiom_ai_core::Result;
 
 /// Trait for safety guards that validate agent actions
 #[async_trait]

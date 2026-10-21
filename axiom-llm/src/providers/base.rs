@@ -194,36 +194,10 @@ impl Default for ProviderConfig {
     }
 }
 
-/// Helper function to create HTTP client with common configuration
-pub fn create_http_client(config: &ProviderConfig) -> Result<reqwest::Client> {
-    let mut client_builder = reqwest::Client::builder();
-
-    // Set timeout
-    if let Some(timeout) = config.timeout_seconds {
-        client_builder = client_builder.timeout(std::time::Duration::from_secs(timeout));
-    }
-
-    // Set default headers
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::CONTENT_TYPE,
-        "application/json".parse().unwrap(),
-    );
-
-    if let Some(api_key) = &config.api_key {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", api_key).parse().unwrap(),
-        );
-    }
-
-    client_builder
-        .default_headers(headers)
-        .build()
-        .map_err(|e| AxiomError::LlmProvider(format!("Failed to create HTTP client: {}", e)))
-}
-
-/// Common error handling for provider responses
+/// Common error handling for provider responses.
+///
+/// 429 maps to `RateLimit` and any 5xx (including 529 "overloaded") maps to `ProviderUnavailable`.
+/// Both are retryable. Other client errors map to permanent `LlmProvider` or `Authentication` errors.
 pub fn handle_provider_error(status: reqwest::StatusCode, body: &str) -> AxiomError {
     match status {
         reqwest::StatusCode::UNAUTHORIZED => {
@@ -241,11 +215,8 @@ pub fn handle_provider_error(status: reqwest::StatusCode, body: &str) -> AxiomEr
         reqwest::StatusCode::NOT_FOUND => {
             AxiomError::LlmProvider("Resource not found".to_string())
         }
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR => {
-            AxiomError::LlmProvider("Internal server error from provider".to_string())
-        }
-        reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-            AxiomError::LlmProvider("Service temporarily unavailable".to_string())
+        s if s.is_server_error() => {
+            AxiomError::ProviderUnavailable(format!("Provider unavailable ({}): {}", s, body))
         }
         _ => {
             AxiomError::LlmProvider(format!("Unexpected error: {} - {}", status, body))

@@ -1,6 +1,4 @@
 //! Claude provider (alias for Anthropic)
 
-pub use super::anthropic::AnthropicProvider as ClaudeProvider;
-
-// Re-export for convenience
-pub use super::anthropic::*;
+/// Claude provider; an alias for [`AnthropicProvider`](super::AnthropicProvider)
+pub type ClaudeProvider = super::AnthropicProvider;

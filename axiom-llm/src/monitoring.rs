@@ -1,33 +1,35 @@
-//! Monitoring and metrics for LLM operations
+//! Metrics for LLM operations, kept per provider with an aggregate across all of them.
+//!
+//! Metrics are recorded per attempt by [`crate::resilience::ResilientCall`]: every attempt
+//! is either a success or a failure, and token usage is added by the gateway after a
+//! successful generation.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
-use axiom_ai_core::AxiomError;
-use crate::gateway::{LlmRequest, LlmResponse};
+const ONE_MINUTE: Duration = Duration::from_secs(60);
+const ONE_HOUR: Duration = Duration::from_secs(3600);
 
-/// Metrics for LLM operations
+/// Aggregate metrics for LLM operations, with a breakdown per provider
 #[derive(Debug, Clone)]
 pub struct LlmMetrics {
-    /// Total number of requests
+    /// Total number of attempts, across all providers
     pub total_requests: u64,
-    /// Total number of successful requests
+    /// Total number of successful attempts
     pub successful_requests: u64,
-    /// Total number of failed requests
+    /// Total number of failed attempts
     pub failed_requests: u64,
     /// Total tokens used
     pub total_tokens: u64,
     /// Total cost in USD
     pub total_cost: f64,
-    /// Average response time in milliseconds
+    /// Average attempt latency in milliseconds
     pub avg_response_time_ms: f64,
-    /// Provider-specific metrics
+    /// Metrics for each provider, keyed by provider name
     pub provider_metrics: HashMap<String, ProviderMetrics>,
-    /// Request rate (requests per minute)
+    /// Attempts per minute over the last minute, across all providers
     pub request_rate: f64,
-    /// Error rate (errors per minute)
+    /// Failed attempts over the last minute, across all providers
     pub error_rate: f64,
     /// Last updated timestamp
     pub last_updated: Instant,
@@ -38,23 +40,23 @@ pub struct LlmMetrics {
 pub struct ProviderMetrics {
     /// Provider name
     pub provider_name: String,
-    /// Total requests for this provider
+    /// Total attempts for this provider
     pub total_requests: u64,
-    /// Successful requests for this provider
+    /// Successful attempts for this provider
     pub successful_requests: u64,
-    /// Failed requests for this provider
+    /// Failed attempts for this provider
     pub failed_requests: u64,
     /// Total tokens used by this provider
     pub total_tokens: u64,
     /// Total cost for this provider
     pub total_cost: f64,
-    /// Average response time for this provider
+    /// Average attempt latency for this provider
     pub avg_response_time_ms: f64,
-    /// Last request time
+    /// Last attempt time
     pub last_request_time: Option<Instant>,
-    /// Request history (for rate calculation)
+    /// Attempt timestamps from the last hour (for rate calculation)
     pub request_history: Vec<Instant>,
-    /// Error history (for error rate calculation)
+    /// Failed attempt timestamps from the last hour (for error rate calculation)
     pub error_history: Vec<Instant>,
 }
 
@@ -75,71 +77,62 @@ impl LlmMetrics {
         }
     }
 
-    /// Record a request
-    pub fn record_request(&mut self, provider_name: &str, request: &LlmRequest, response: &LlmResponse) {
-        self.total_requests += 1;
-        self.successful_requests += 1;
-        self.total_tokens += response.tokens_used.unwrap_or(0) as u64;
-        self.total_cost += response.cost.unwrap_or(0.0);
-
-        // Update provider metrics
-        let provider_metrics = self.provider_metrics.entry(provider_name.to_string())
-            .or_insert_with(|| ProviderMetrics::new(provider_name.to_string()));
-        
-        provider_metrics.record_request(request, response, true);
-        
-        self.update_rates();
-        self.last_updated = Instant::now();
+    /// Record a successful attempt against `provider_name`
+    pub fn record_success(&mut self, provider_name: &str, latency: Duration) {
+        self.record_attempt(provider_name, latency, true);
     }
 
-    /// Record a failed request
-    pub fn record_failed_request(&mut self, provider_name: &str, request: &LlmRequest, error: &AxiomError) {
-        self.total_requests += 1;
-        self.failed_requests += 1;
-
-        // Update provider metrics
-        let provider_metrics = self.provider_metrics.entry(provider_name.to_string())
-            .or_insert_with(|| ProviderMetrics::new(provider_name.to_string()));
-        
-        provider_metrics.record_failed_request(request, error);
-        
-        self.update_rates();
-        self.last_updated = Instant::now();
+    /// Record a failed attempt against `provider_name`
+    pub fn record_failure(&mut self, provider_name: &str, latency: Duration) {
+        self.record_attempt(provider_name, latency, false);
     }
 
-    /// Record a streaming request
-    pub fn record_stream_request(&mut self, provider_name: &str, request: &LlmRequest) {
-        // For streaming requests, we'll just record the request
-        // The actual metrics will be updated when the stream completes
-        self.total_requests += 1;
+    /// Add token usage and cost for `provider_name`. Does not count as an attempt.
+    pub fn record_usage(&mut self, provider_name: &str, tokens: u64, cost: f64) {
+        self.total_tokens = self.total_tokens.saturating_add(tokens);
+        self.total_cost += cost;
 
-        let provider_metrics = self.provider_metrics.entry(provider_name.to_string())
-            .or_insert_with(|| ProviderMetrics::new(provider_name.to_string()));
-        
-        provider_metrics.record_stream_request(request);
-        
-        self.update_rates();
-        self.last_updated = Instant::now();
+        let provider = self.provider_entry(provider_name);
+        provider.total_tokens = provider.total_tokens.saturating_add(tokens);
+        provider.total_cost += cost;
     }
 
-    /// Update request and error rates
-    fn update_rates(&mut self) {
+    fn record_attempt(&mut self, provider_name: &str, latency: Duration, success: bool) {
         let now = Instant::now();
-        let one_minute_ago = now - Duration::from_secs(60);
+        let latency_ms = latency.as_secs_f64() * 1000.0;
 
-        // Calculate request rate
-        let recent_requests = self.provider_metrics.values()
-            .flat_map(|pm| &pm.request_history)
-            .filter(|&&time| time > one_minute_ago)
-            .count();
-        self.request_rate = recent_requests as f64 / 60.0;
+        self.total_requests += 1;
+        if success {
+            self.successful_requests += 1;
+        } else {
+            self.failed_requests += 1;
+        }
+        self.avg_response_time_ms = running_average(self.avg_response_time_ms, self.total_requests, latency_ms);
 
-        // Calculate error rate
-        let recent_errors = self.provider_metrics.values()
-            .flat_map(|pm| &pm.error_history)
-            .filter(|&&time| time > one_minute_ago)
-            .count();
-        self.error_rate = recent_errors as f64 / 60.0;
+        self.provider_entry(provider_name).record_attempt(now, latency_ms, success);
+
+        self.update_rates(now);
+        self.last_updated = now;
+    }
+
+    fn provider_entry(&mut self, provider_name: &str) -> &mut ProviderMetrics {
+        self.provider_metrics
+            .entry(provider_name.to_string())
+            .or_insert_with(|| ProviderMetrics::new(provider_name.to_string()))
+    }
+
+    /// Recompute the aggregate per-minute rates from the provider histories
+    fn update_rates(&mut self, now: Instant) {
+        self.request_rate = self
+            .provider_metrics
+            .values()
+            .map(|pm| count_within(&pm.request_history, now, ONE_MINUTE))
+            .sum::<usize>() as f64;
+        self.error_rate = self
+            .provider_metrics
+            .values()
+            .map(|pm| count_within(&pm.error_history, now, ONE_MINUTE))
+            .sum::<usize>() as f64;
     }
 
     /// Get metrics for a specific provider
@@ -155,6 +148,12 @@ impl LlmMetrics {
     /// Reset all metrics
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+}
+
+impl Default for LlmMetrics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -175,59 +174,21 @@ impl ProviderMetrics {
         }
     }
 
-    /// Record a successful request
-    pub fn record_request(&mut self, _request: &LlmRequest, response: &LlmResponse, success: bool) {
-        let now = Instant::now();
-        
+    fn record_attempt(&mut self, now: Instant, latency_ms: f64, success: bool) {
         self.total_requests += 1;
         if success {
             self.successful_requests += 1;
-            self.total_tokens += response.tokens_used.unwrap_or(0) as u64;
-            self.total_cost += response.cost.unwrap_or(0.0);
         } else {
             self.failed_requests += 1;
+            self.error_history.push(now);
         }
-
-        // Update average response time
-        let response_time = response.generation_time_ms as f64;
-        self.avg_response_time_ms = (self.avg_response_time_ms * (self.total_requests - 1) as f64 + response_time) / self.total_requests as f64;
+        self.avg_response_time_ms = running_average(self.avg_response_time_ms, self.total_requests, latency_ms);
 
         self.last_request_time = Some(now);
         self.request_history.push(now);
 
-        // Clean up old history (keep only last hour)
-        let one_hour_ago = now - Duration::from_secs(3600);
-        self.request_history.retain(|&time| time > one_hour_ago);
-    }
-
-    /// Record a failed request
-    pub fn record_failed_request(&mut self, _request: &LlmRequest, _error: &AxiomError) {
-        let now = Instant::now();
-        
-        self.total_requests += 1;
-        self.failed_requests += 1;
-
-        self.last_request_time = Some(now);
-        self.request_history.push(now);
-        self.error_history.push(now);
-
-        // Clean up old history
-        let one_hour_ago = now - Duration::from_secs(3600);
-        self.request_history.retain(|&time| time > one_hour_ago);
-        self.error_history.retain(|&time| time > one_hour_ago);
-    }
-
-    /// Record a streaming request
-    pub fn record_stream_request(&mut self, _request: &LlmRequest) {
-        let now = Instant::now();
-        
-        self.total_requests += 1;
-        self.last_request_time = Some(now);
-        self.request_history.push(now);
-
-        // Clean up old history
-        let one_hour_ago = now - Duration::from_secs(3600);
-        self.request_history.retain(|&time| time > one_hour_ago);
+        self.request_history.retain(|&t| now.saturating_duration_since(t) < ONE_HOUR);
+        self.error_history.retain(|&t| now.saturating_duration_since(t) < ONE_HOUR);
     }
 
     /// Get success rate
@@ -248,164 +209,62 @@ impl ProviderMetrics {
         }
     }
 
-    /// Get requests per minute
+    /// Attempts in the last minute
     pub fn requests_per_minute(&self) -> f64 {
-        let now = Instant::now();
-        let one_minute_ago = now - Duration::from_secs(60);
-        
-        let recent_requests = self.request_history.iter()
-            .filter(|&&time| time > one_minute_ago)
-            .count();
-        
-        recent_requests as f64
+        count_within(&self.request_history, Instant::now(), ONE_MINUTE) as f64
     }
 
-    /// Get errors per minute
+    /// Failed attempts in the last minute
     pub fn errors_per_minute(&self) -> f64 {
-        let now = Instant::now();
-        let one_minute_ago = now - Duration::from_secs(60);
-        
-        let recent_errors = self.error_history.iter()
-            .filter(|&&time| time > one_minute_ago)
-            .count();
-        
-        recent_errors as f64
+        count_within(&self.error_history, Instant::now(), ONE_MINUTE) as f64
     }
 }
 
-/// Health check for LLM services
-#[derive(Debug, Clone)]
-pub struct HealthCheck {
-    /// Provider name
-    pub provider_name: String,
-    /// Whether the provider is healthy
-    pub is_healthy: bool,
-    /// Last check time
-    pub last_check: Instant,
-    /// Error message if unhealthy
-    pub error_message: Option<String>,
-    /// Response time for the health check
-    pub response_time_ms: Option<u64>,
+/// Number of timestamps no older than `window` at `now`
+fn count_within(times: &[Instant], now: Instant, window: Duration) -> usize {
+    times
+        .iter()
+        .filter(|&&t| now.saturating_duration_since(t) < window)
+        .count()
 }
 
-impl HealthCheck {
-    /// Create a new health check
-    pub fn new(provider_name: String) -> Self {
-        Self {
-            provider_name,
-            is_healthy: true,
-            last_check: Instant::now(),
-            error_message: None,
-            response_time_ms: None,
-        }
-    }
-
-    /// Mark as healthy
-    pub fn mark_healthy(&mut self, response_time_ms: Option<u64>) {
-        self.is_healthy = true;
-        self.last_check = Instant::now();
-        self.error_message = None;
-        self.response_time_ms = response_time_ms;
-    }
-
-    /// Mark as unhealthy
-    pub fn mark_unhealthy(&mut self, error_message: String) {
-        self.is_healthy = false;
-        self.last_check = Instant::now();
-        self.error_message = Some(error_message);
-        self.response_time_ms = None;
-    }
-
-    /// Check if the health check is stale
-    pub fn is_stale(&self, max_age: Duration) -> bool {
-        self.last_check.elapsed() > max_age
-    }
+/// Incremental mean: folds `sample` into `average`, where `count` is the number of samples including this one
+fn running_average(average: f64, count: u64, sample: f64) -> f64 {
+    average + (sample - average) / count as f64
 }
 
-/// Monitoring service for LLM operations
-pub struct MonitoringService {
-    metrics: Arc<RwLock<LlmMetrics>>,
-    health_checks: Arc<RwLock<HashMap<String, HealthCheck>>>,
-    max_health_check_age: Duration,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl MonitoringService {
-    /// Create a new monitoring service
-    pub fn new() -> Self {
-        Self {
-            metrics: Arc::new(RwLock::new(LlmMetrics::new())),
-            health_checks: Arc::new(RwLock::new(HashMap::new())),
-            max_health_check_age: Duration::from_secs(300), // 5 minutes
-        }
+    #[test]
+    fn failures_are_counted_for_the_provider_that_failed_only() {
+        let mut metrics = LlmMetrics::new();
+        metrics.record_failure("a", Duration::from_millis(10));
+        metrics.record_success("b", Duration::from_millis(10));
+
+        let a = metrics.get_provider_metrics("a").expect("provider a recorded");
+        assert_eq!(a.failed_requests, 1);
+        assert_eq!(a.successful_requests, 0);
+
+        let b = metrics.get_provider_metrics("b").expect("provider b recorded");
+        assert_eq!(b.failed_requests, 0);
+        assert_eq!(b.successful_requests, 1);
+
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.failed_requests, 1);
     }
 
-    /// Get metrics
-    pub async fn get_metrics(&self) -> LlmMetrics {
-        self.metrics.read().await.clone()
-    }
+    #[test]
+    fn usage_is_added_without_counting_an_attempt() {
+        let mut metrics = LlmMetrics::new();
+        metrics.record_success("a", Duration::ZERO);
+        metrics.record_usage("a", 120, 0.5);
 
-    /// Record a request
-    pub async fn record_request(&self, provider_name: &str, request: &LlmRequest, response: &LlmResponse) {
-        let mut metrics = self.metrics.write().await;
-        metrics.record_request(provider_name, request, response);
-    }
-
-    /// Record a failed request
-    pub async fn record_failed_request(&self, provider_name: &str, request: &LlmRequest, error: &AxiomError) {
-        let mut metrics = self.metrics.write().await;
-        metrics.record_failed_request(provider_name, request, error);
-    }
-
-    /// Record a streaming request
-    pub async fn record_stream_request(&self, provider_name: &str, request: &LlmRequest) {
-        let mut metrics = self.metrics.write().await;
-        metrics.record_stream_request(provider_name, request);
-    }
-
-    /// Update health check for a provider
-    pub async fn update_health_check(&self, provider_name: &str, is_healthy: bool, error_message: Option<String>, response_time_ms: Option<u64>) {
-        let mut health_checks = self.health_checks.write().await;
-        let health_check = health_checks.entry(provider_name.to_string())
-            .or_insert_with(|| HealthCheck::new(provider_name.to_string()));
-
-        if is_healthy {
-            health_check.mark_healthy(response_time_ms);
-        } else {
-            health_check.mark_unhealthy(error_message.unwrap_or_else(|| "Unknown error".to_string()));
-        }
-    }
-
-    /// Get health status for all providers
-    pub async fn get_health_status(&self) -> HashMap<String, HealthCheck> {
-        self.health_checks.read().await.clone()
-    }
-
-    /// Get health status for a specific provider
-    pub async fn get_provider_health(&self, provider_name: &str) -> Option<HealthCheck> {
-        self.health_checks.read().await.get(provider_name).cloned()
-    }
-
-    /// Check if a provider is healthy
-    pub async fn is_provider_healthy(&self, provider_name: &str) -> bool {
-        if let Some(health_check) = self.get_provider_health(provider_name).await {
-            health_check.is_healthy && !health_check.is_stale(self.max_health_check_age)
-        } else {
-            false
-        }
-    }
-
-    /// Get unhealthy providers
-    pub async fn get_unhealthy_providers(&self) -> Vec<String> {
-        let health_checks = self.health_checks.read().await;
-        health_checks.iter()
-            .filter(|(_, health_check)| !health_check.is_healthy || health_check.is_stale(self.max_health_check_age))
-            .map(|(name, _)| name.clone())
-            .collect()
-    }
-}
-
-impl Default for MonitoringService {
-    fn default() -> Self {
-        Self::new()
+        assert_eq!(metrics.total_requests, 1);
+        assert_eq!(metrics.total_tokens, 120);
+        let a = metrics.get_provider_metrics("a").unwrap();
+        assert_eq!(a.total_tokens, 120);
+        assert!((a.total_cost - 0.5).abs() < f64::EPSILON);
     }
 }

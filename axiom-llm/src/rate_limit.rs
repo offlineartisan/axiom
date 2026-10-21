@@ -1,4 +1,8 @@
 //! Rate limiting implementation
+//!
+//! Limits are per provider. A provider with no configured limit is not limited at all:
+//! there is no implicit default. Time is passed in explicitly (usually from a
+//! [`Clock`](crate::clock::Clock)) so tests can drive it deterministically.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,81 +11,77 @@ use tokio::sync::RwLock;
 
 use axiom_ai_core::{Result, AxiomError};
 
-/// Rate limiter using token bucket algorithm
+/// Token bucket that refills continuously at `refill_per_sec` up to `capacity`.
+///
+/// The bucket starts full. It only refills while time is observed through its methods.
 #[derive(Debug)]
 pub struct TokenBucket {
-    /// Maximum number of tokens
-    capacity: u32,
-    /// Current number of tokens
-    tokens: u32,
-    /// Rate of token refill (tokens per second)
-    refill_rate: f64,
-    /// Last refill time
-    last_refill: Instant,
+    capacity: f64,
+    tokens: f64,
+    refill_per_sec: f64,
+    last_refill: Option<Instant>,
 }
 
 impl TokenBucket {
-    /// Create a new token bucket
-    pub fn new(capacity: u32, refill_rate: f64) -> Self {
+    /// Create a full bucket. A `refill_per_sec` of zero means it never refills.
+    pub fn new(capacity: u32, refill_per_sec: f64) -> Self {
         Self {
-            capacity,
-            tokens: capacity,
-            refill_rate,
-            last_refill: Instant::now(),
+            capacity: f64::from(capacity),
+            tokens: f64::from(capacity),
+            refill_per_sec,
+            last_refill: None,
         }
     }
 
-    /// Try to consume tokens
-    pub fn try_consume(&mut self, tokens: u32) -> bool {
-        self.refill();
-        
-        if self.tokens >= tokens {
-            self.tokens -= tokens;
+    /// Add the tokens earned since the last observation, capped at capacity
+    fn refill(&mut self, now: Instant) {
+        if let Some(last) = self.last_refill {
+            let elapsed = now.saturating_duration_since(last).as_secs_f64();
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        }
+        self.last_refill = Some(now);
+    }
+
+    /// Try to take `tokens` from the bucket. Returns `false` and takes nothing if not enough are available.
+    pub fn try_consume(&mut self, now: Instant, tokens: u32) -> bool {
+        self.refill(now);
+        let needed = f64::from(tokens);
+        if self.tokens >= needed {
+            self.tokens -= needed;
             true
         } else {
             false
         }
     }
 
-    /// Refill tokens based on elapsed time
-    fn refill(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill);
-        let tokens_to_add = (elapsed.as_secs_f64() * self.refill_rate) as u32;
-        
-        if tokens_to_add > 0 {
-            self.tokens = std::cmp::min(self.capacity, self.tokens + tokens_to_add);
-            self.last_refill = now;
-        }
+    /// Whole tokens currently available
+    pub fn available_tokens(&mut self, now: Instant) -> u32 {
+        self.refill(now);
+        // Non-negative and at most `capacity` (a u32), so the cast cannot truncate.
+        self.tokens.floor() as u32
     }
 
-    /// Get the number of available tokens
-    pub fn available_tokens(&mut self) -> u32 {
-        self.refill();
-        self.tokens
-    }
-
-    /// Get the time until the next token is available
-    pub fn time_until_next_token(&mut self) -> Duration {
-        self.refill();
-        
-        if self.tokens > 0 {
-            Duration::from_secs(0)
+    /// Time until `tokens` could be taken. Zero if they are available now, `Duration::MAX` if the bucket never refills.
+    pub fn time_until(&mut self, now: Instant, tokens: u32) -> Duration {
+        self.refill(now);
+        let missing = f64::from(tokens) - self.tokens;
+        if missing <= 0.0 {
+            Duration::ZERO
+        } else if self.refill_per_sec > 0.0 {
+            Duration::from_secs_f64(missing / self.refill_per_sec)
         } else {
-            let tokens_needed = 1;
-            let seconds_needed = tokens_needed as f64 / self.refill_rate;
-            Duration::from_secs_f64(seconds_needed)
+            Duration::MAX
         }
     }
 }
 
-/// Rate limiter for a specific resource
+/// Rate limiter for a single provider: optional request and token buckets
 #[derive(Debug)]
 pub struct RateLimiter {
-    /// Token bucket for requests
-    request_bucket: TokenBucket,
-    /// Token bucket for tokens
-    token_bucket: Option<TokenBucket>,
+    /// Bucket for requests, absent when requests are unlimited
+    requests: Option<TokenBucket>,
+    /// Bucket for tokens, absent when tokens are unlimited
+    tokens: Option<TokenBucket>,
     /// Maximum requests per minute
     requests_per_minute: Option<u32>,
     /// Maximum tokens per minute
@@ -89,93 +89,94 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Create a new rate limiter
-    pub fn new(
-        requests_per_minute: Option<u32>,
-        tokens_per_minute: Option<u32>,
-    ) -> Self {
-        let request_bucket = if let Some(rpm) = requests_per_minute {
-            TokenBucket::new(rpm, rpm as f64 / 60.0)
-        } else {
-            TokenBucket::new(u32::MAX, f64::INFINITY)
-        };
-
-        let token_bucket = if let Some(tpm) = tokens_per_minute {
-            Some(TokenBucket::new(tpm, tpm as f64 / 60.0))
-        } else {
-            None
-        };
-
+    /// Create a rate limiter. `None` for a dimension means it is unlimited.
+    pub fn new(requests_per_minute: Option<u32>, tokens_per_minute: Option<u32>) -> Self {
         Self {
-            request_bucket,
-            token_bucket,
+            requests: requests_per_minute.map(|rpm| TokenBucket::new(rpm, per_second(rpm))),
+            tokens: tokens_per_minute.map(|tpm| TokenBucket::new(tpm, per_second(tpm))),
             requests_per_minute,
             tokens_per_minute,
         }
     }
 
-    /// Check if a request is allowed
-    pub fn is_request_allowed(&mut self) -> bool {
-        self.request_bucket.try_consume(1)
-    }
+    /// Admit one request that will use `token_count` tokens.
+    ///
+    /// Both buckets are checked before either is charged, so a rejected request costs nothing.
+    /// The token cost is capped at the tokens-per-minute limit, so an oversized request is
+    /// admitted once the bucket is full instead of waiting forever. On rejection, returns how
+    /// long to wait.
+    pub fn try_acquire(&mut self, now: Instant, token_count: u32) -> std::result::Result<(), Duration> {
+        let token_cost = match self.tokens_per_minute {
+            Some(tpm) => token_count.min(tpm),
+            None => token_count,
+        };
 
-    /// Check if a request with token count is allowed
-    pub fn is_request_with_tokens_allowed(&mut self, token_count: u32) -> bool {
-        if !self.is_request_allowed() {
-            return false;
+        let wait_requests = self
+            .requests
+            .as_mut()
+            .map_or(Duration::ZERO, |bucket| bucket.time_until(now, 1));
+        let wait_tokens = self
+            .tokens
+            .as_mut()
+            .map_or(Duration::ZERO, |bucket| bucket.time_until(now, token_cost));
+
+        let wait = wait_requests.max(wait_tokens);
+        if !wait.is_zero() {
+            return Err(wait);
         }
 
-        if let Some(ref mut bucket) = self.token_bucket {
-            bucket.try_consume(token_count)
-        } else {
-            true
+        // Both buckets were checked above, so these charges succeed.
+        if let Some(bucket) = self.requests.as_mut() {
+            bucket.try_consume(now, 1);
         }
+        if let Some(bucket) = self.tokens.as_mut() {
+            bucket.try_consume(now, token_cost);
+        }
+        Ok(())
     }
 
-    /// Get the time until the next request is allowed
-    pub fn time_until_next_request(&mut self) -> Duration {
-        self.request_bucket.time_until_next_token()
-    }
-
-    /// Get the time until enough tokens are available
-    pub fn time_until_tokens_available(&mut self, token_count: u32) -> Duration {
-        if let Some(ref mut bucket) = self.token_bucket {
-            let available = bucket.available_tokens();
-            if available >= token_count {
-                Duration::from_secs(0)
-            } else {
-                let needed = token_count - available;
-                let seconds_needed = needed as f64 / bucket.refill_rate;
-                Duration::from_secs_f64(seconds_needed)
-            }
-        } else {
-            Duration::from_secs(0)
+    /// Snapshot of the limiter at `now`
+    pub fn status(&mut self, now: Instant) -> RateLimitStatus {
+        RateLimitStatus {
+            requests_per_minute: self.requests_per_minute,
+            tokens_per_minute: self.tokens_per_minute,
+            available_requests: self.requests.as_mut().map(|bucket| bucket.available_tokens(now)),
+            available_tokens: self.tokens.as_mut().map(|bucket| bucket.available_tokens(now)),
+            time_until_next_request: self
+                .requests
+                .as_mut()
+                .map_or(Duration::ZERO, |bucket| bucket.time_until(now, 1)),
         }
     }
 }
 
-/// Rate limiting configuration
+/// Convert a per-minute limit to a per-second refill rate
+fn per_second(per_minute: u32) -> f64 {
+    f64::from(per_minute) / 60.0
+}
+
+/// Rate limits for every provider
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
     /// Rate limiters by provider name
     limiters: Arc<RwLock<HashMap<String, RateLimiter>>>,
-    /// Default rate limits
+    /// Limits applied to providers without an explicit limiter. `None` leaves them unlimited.
     default_requests_per_minute: Option<u32>,
-    /// Default tokens per minute
+    /// Token limit applied to providers without an explicit limiter. `None` leaves them unlimited.
     default_tokens_per_minute: Option<u32>,
 }
 
 impl RateLimitConfig {
-    /// Create a new rate limit configuration
+    /// Create a configuration with no limits: every provider is unlimited until one is configured
     pub fn new() -> Self {
         Self {
             limiters: Arc::new(RwLock::new(HashMap::new())),
-            default_requests_per_minute: Some(60),
-            default_tokens_per_minute: Some(10000),
+            default_requests_per_minute: None,
+            default_tokens_per_minute: None,
         }
     }
 
-    /// Set default rate limits
+    /// Set the limits applied to providers without an explicit limiter
     pub fn with_default_limits(
         mut self,
         requests_per_minute: Option<u32>,
@@ -200,86 +201,46 @@ impl RateLimitConfig {
         );
     }
 
-    /// Check if a request is allowed for a provider
-    pub async fn check_rate_limit(&self, provider_name: &str) -> Result<()> {
-        let mut limiters = self.limiters.write().await;
-        
-        // Get or create limiter for this provider
-        if !limiters.contains_key(provider_name) {
-            limiters.insert(
-                provider_name.to_string(),
-                RateLimiter::new(
-                    self.default_requests_per_minute,
-                    self.default_tokens_per_minute,
-                ),
-            );
-        }
-
-        let limiter = limiters.get_mut(provider_name).unwrap();
-        
-        if !limiter.is_request_allowed() {
-            let wait_time = limiter.time_until_next_request();
-            return Err(AxiomError::RateLimit(format!(
-                "Rate limit exceeded for provider '{}'. Try again in {:?}",
-                provider_name, wait_time
-            )));
-        }
-
-        Ok(())
+    /// Check that one request to `provider_name` is allowed at `now`
+    pub async fn check_rate_limit(&self, provider_name: &str, now: Instant) -> Result<()> {
+        self.check_rate_limit_with_tokens(provider_name, now, 0).await
     }
 
-    /// Check if a request with token count is allowed
+    /// Check that one request using `token_count` tokens is allowed at `now`
     pub async fn check_rate_limit_with_tokens(
         &self,
         provider_name: &str,
+        now: Instant,
         token_count: u32,
     ) -> Result<()> {
         let mut limiters = self.limiters.write().await;
-        
-        // Get or create limiter for this provider
+
         if !limiters.contains_key(provider_name) {
+            // No explicit limiter and no default limits: nothing to enforce.
+            if self.default_requests_per_minute.is_none() && self.default_tokens_per_minute.is_none() {
+                return Ok(());
+            }
             limiters.insert(
                 provider_name.to_string(),
-                RateLimiter::new(
-                    self.default_requests_per_minute,
-                    self.default_tokens_per_minute,
-                ),
+                RateLimiter::new(self.default_requests_per_minute, self.default_tokens_per_minute),
             );
         }
 
-        let limiter = limiters.get_mut(provider_name).unwrap();
-        
-        if !limiter.is_request_with_tokens_allowed(token_count) {
-            let wait_time = std::cmp::max(
-                limiter.time_until_next_request(),
-                limiter.time_until_tokens_available(token_count),
-            );
-            return Err(AxiomError::RateLimit(format!(
-                "Rate limit exceeded for provider '{}' with {} tokens. Try again in {:?}",
-                provider_name, token_count, wait_time
-            )));
+        match limiters.get_mut(provider_name) {
+            Some(limiter) => limiter.try_acquire(now, token_count).map_err(|wait| {
+                AxiomError::RateLimit(format!(
+                    "Rate limit exceeded for provider '{}' with {} tokens. Try again in {:?}",
+                    provider_name, token_count, wait
+                ))
+            }),
+            None => Ok(()),
         }
-
-        Ok(())
     }
 
-    /// Get rate limit status for a provider
-    pub async fn get_status(&self, provider_name: &str) -> Option<RateLimitStatus> {
+    /// Get rate limit status for a provider at `now`. `None` if the provider has no limiter.
+    pub async fn get_status(&self, provider_name: &str, now: Instant) -> Option<RateLimitStatus> {
         let mut limiters = self.limiters.write().await;
-        
-        if let Some(limiter) = limiters.get_mut(provider_name) {
-            Some(RateLimitStatus {
-                requests_per_minute: limiter.requests_per_minute,
-                tokens_per_minute: limiter.tokens_per_minute,
-                available_requests: limiter.request_bucket.available_tokens(),
-                available_tokens: limiter.token_bucket.as_mut()
-                    .map(|b| b.available_tokens())
-                    .unwrap_or(u32::MAX),
-                time_until_next_request: limiter.time_until_next_request(),
-            })
-        } else {
-            None
-        }
+        limiters.get_mut(provider_name).map(|limiter| limiter.status(now))
     }
 }
 
@@ -292,65 +253,127 @@ impl Default for RateLimitConfig {
 /// Rate limit status for a provider
 #[derive(Debug, Clone)]
 pub struct RateLimitStatus {
-    /// Maximum requests per minute
+    /// Maximum requests per minute, `None` if unlimited
     pub requests_per_minute: Option<u32>,
-    /// Maximum tokens per minute
+    /// Maximum tokens per minute, `None` if unlimited
     pub tokens_per_minute: Option<u32>,
-    /// Available requests
-    pub available_requests: u32,
-    /// Available tokens
-    pub available_tokens: u32,
-    /// Time until next request is allowed
+    /// Requests available right now, `None` if unlimited
+    pub available_requests: Option<u32>,
+    /// Tokens available right now, `None` if unlimited
+    pub available_tokens: Option<u32>,
+    /// Time until the next request is allowed
     pub time_until_next_request: Duration,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
+    use crate::clock::{Clock, FakeClock};
 
-    #[tokio::test]
-    async fn test_token_bucket() {
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let clock = FakeClock::new();
         let mut bucket = TokenBucket::new(10, 1.0); // 10 tokens, 1 per second
 
-        // Should allow consuming all tokens initially
-        assert!(bucket.try_consume(10));
-        assert!(!bucket.try_consume(1));
+        assert!(bucket.try_consume(clock.now(), 10));
+        assert!(!bucket.try_consume(clock.now(), 1));
 
-        // Wait for refill
-        sleep(Duration::from_secs(1)).await;
-        assert!(bucket.try_consume(1));
+        clock.advance(Duration::from_secs(1));
+        assert!(bucket.try_consume(clock.now(), 1));
+        assert!(!bucket.try_consume(clock.now(), 1));
     }
 
-    #[tokio::test]
-    async fn test_rate_limiter() {
-        let mut limiter = RateLimiter::new(Some(60), Some(1000)); // 60 RPM, 1000 TPM
+    #[test]
+    fn token_bucket_keeps_fractional_refill_and_caps_at_capacity() {
+        let clock = FakeClock::new();
+        let mut bucket = TokenBucket::new(10, 1.0);
+        assert!(bucket.try_consume(clock.now(), 10));
 
-        // Should allow requests initially
-        assert!(limiter.is_request_allowed());
-        assert!(limiter.is_request_with_tokens_allowed(100));
+        // Half a second at a time: the fractions must add up, not be dropped.
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(bucket.available_tokens(clock.now()), 0);
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(bucket.available_tokens(clock.now()), 1);
 
-        // Consume all requests
-        for _ in 0..60 {
-            assert!(limiter.is_request_allowed());
+        // A long idle period refills to capacity and no further.
+        clock.advance(Duration::from_secs(3600));
+        assert_eq!(bucket.available_tokens(clock.now()), 10);
+    }
+
+    #[test]
+    fn time_until_reports_the_wait_for_missing_tokens() {
+        let clock = FakeClock::new();
+        let mut bucket = TokenBucket::new(1, 2.0); // 2 tokens per second
+        assert!(bucket.try_consume(clock.now(), 1));
+        assert_eq!(bucket.time_until(clock.now(), 1), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn unlimited_limiter_never_rejects_after_time_advances() {
+        let clock = FakeClock::new();
+        let mut limiter = RateLimiter::new(None, None);
+
+        for _ in 0..3 {
+            clock.advance(Duration::from_secs(3600));
+            assert!(limiter.try_acquire(clock.now(), u32::MAX).is_ok());
         }
-        assert!(!limiter.is_request_allowed());
+    }
+
+    #[test]
+    fn limiter_charges_both_buckets_only_when_admitted() {
+        let clock = FakeClock::new();
+        let mut limiter = RateLimiter::new(Some(60), Some(100));
+
+        assert!(limiter.try_acquire(clock.now(), 100).is_ok());
+        // Token bucket is empty, so this is rejected and must not charge the request bucket.
+        assert!(limiter.try_acquire(clock.now(), 1).is_err());
+
+        let status = limiter.status(clock.now());
+        assert_eq!(status.available_requests, Some(59));
+        assert_eq!(status.available_tokens, Some(0));
+    }
+
+    #[test]
+    fn oversized_token_cost_is_capped_at_the_token_limit() {
+        let clock = FakeClock::new();
+        let mut limiter = RateLimiter::new(None, Some(100));
+
+        assert!(limiter.try_acquire(clock.now(), 10_000).is_ok());
+        assert!(limiter.try_acquire(clock.now(), 10_000).is_err());
     }
 
     #[tokio::test]
-    async fn test_rate_limit_config() {
+    async fn only_configured_providers_are_limited() {
+        let clock = FakeClock::new();
+        let config = RateLimitConfig::new();
+        config.add_limiter("limited".to_string(), Some(1), None).await;
+
+        // No limiter and no defaults: unlimited.
+        assert!(config.check_rate_limit("unconfigured", clock.now()).await.is_ok());
+        assert!(config.check_rate_limit("unconfigured", clock.now()).await.is_ok());
+
+        assert!(config.check_rate_limit("limited", clock.now()).await.is_ok());
+        assert!(config.check_rate_limit("limited", clock.now()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn default_limits_apply_to_providers_without_a_limiter() {
+        let clock = FakeClock::new();
+        let config = RateLimitConfig::new().with_default_limits(Some(1), None);
+
+        assert!(config.check_rate_limit("anything", clock.now()).await.is_ok());
+        assert!(config.check_rate_limit("anything", clock.now()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unlimited_config_does_not_panic_after_time_advances() {
+        let clock = FakeClock::new();
         let config = RateLimitConfig::new();
 
-        // Should allow requests initially
-        assert!(config.check_rate_limit("test").await.is_ok());
-
-        // Add a limiter with low limits
-        config.add_limiter("limited".to_string(), Some(1), Some(100)).await;
-
-        // First request should succeed
-        assert!(config.check_rate_limit("limited").await.is_ok());
-
-        // Second request should fail
-        assert!(config.check_rate_limit("limited").await.is_err());
+        clock.advance(Duration::from_secs(7 * 24 * 3600));
+        assert!(config
+            .check_rate_limit_with_tokens("provider", clock.now(), u32::MAX)
+            .await
+            .is_ok());
     }
 }

@@ -71,9 +71,9 @@ axiom-examples/      # Example applications and demos
 ### Basic Agent
 
 ```rust
-use axiom_core::prelude::*;
-use axiom_llm::{LlmGateway, OpenAIProvider, ProviderConfig};
-use axiom_agents::{Agent, AgentConfig, SimplePlanner, SimpleExecutor, SimpleSafetyGuard};
+use axiom_ai_core::prelude::*;
+use axiom_ai_llm::{LlmGateway, OpenAIProvider, ProviderConfig};
+use axiom_ai_agents::{Agent, AgentConfig, SimplePlanner, SimpleSafetyGuard};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -91,9 +91,8 @@ async fn main() -> Result<()> {
     );
 
     // Create agent components
-    let memory = Box::new(axiom_core::InMemoryMemory::new());
+    let memory = Box::new(axiom_ai_core::InMemoryMemory::new());
     let planner = Box::new(SimplePlanner::new(10));
-    let executor = Box::new(SimpleExecutor::new(llm_gateway.clone(), "gpt-3.5-turbo".to_string()));
     let safety_guard = Box::new(SimpleSafetyGuard::new());
     let config = AgentConfig::default();
 
@@ -102,16 +101,17 @@ async fn main() -> Result<()> {
         llm_gateway,
         memory,
         planner,
-        executor,
         safety_guard,
         config,
     );
 
-    // Process a message
+    // Process a message. The outcome traces the plan, tool calls and safety verdicts.
     let message = Message::user("What is 2 + 2?");
-    let result = agent.process_message(message).await?;
+    let outcome = agent.process_message(message).await?;
 
-    println!("Agent response: {:?}", result);
+    if let Some(reply) = outcome.messages.last().and_then(|m| m.text_content()) {
+        println!("Agent response: {}", reply);
+    }
     Ok(())
 }
 ```
@@ -211,9 +211,9 @@ Add Axiom to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-axiom-core = "0.1.0"
-axiom-llm = "0.1.0"
-axiom-agents = "0.1.0"
+axiom-ai-core = "0.2.0"
+axiom-ai-llm = "0.2.0"
+axiom-ai-agents = "0.2.0"
 axiom-rag = "0.1.0"
 axiom-wasm = "0.1.0"
 axiom-monitoring = "0.1.0"

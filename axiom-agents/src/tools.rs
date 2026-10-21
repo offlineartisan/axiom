@@ -31,6 +31,7 @@ impl Tool for CalculatorTool {
                 ParameterType::String,
                 "Mathematical expression to evaluate"
             ).required())
+            .required("expression")
     }
 
     async fn execute(&self, arguments: HashMap<String, serde_json::Value>) -> Result<ToolResult> {
@@ -109,6 +110,7 @@ impl Tool for WeatherTool {
                 ParameterType::Enum,
                 "Temperature units (celsius, fahrenheit)"
             ).enum_values(vec!["celsius".to_string(), "fahrenheit".to_string()]))
+            .required("location")
     }
 
     async fn execute(&self, arguments: HashMap<String, serde_json::Value>) -> Result<ToolResult> {
@@ -169,6 +171,7 @@ impl Tool for SearchTool {
                 ParameterType::Integer,
                 "Number of results to return"
             ))
+            .required("query")
     }
 
     async fn execute(&self, arguments: HashMap<String, serde_json::Value>) -> Result<ToolResult> {
@@ -234,6 +237,8 @@ impl Tool for FileTool {
                 ParameterType::String,
                 "Content to write (for write operation)"
             ))
+            .required("operation")
+            .required("path")
     }
 
     async fn execute(&self, arguments: HashMap<String, serde_json::Value>) -> Result<ToolResult> {

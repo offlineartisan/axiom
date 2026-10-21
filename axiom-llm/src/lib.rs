@@ -3,14 +3,18 @@
 //! This crate provides a unified interface for working with different LLM providers,
 //! with built-in retry logic, rate limiting, and monitoring.
 
+pub mod clock;
 pub mod gateway;
 pub mod providers;
+pub mod resilience;
 pub mod retry;
 pub mod rate_limit;
 pub mod monitoring;
 
+pub use clock::*;
 pub use gateway::*;
 pub use providers::*;
+pub use resilience::*;
 pub use retry::*;
 pub use rate_limit::*;
 pub use monitoring::*;

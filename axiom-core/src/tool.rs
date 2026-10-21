@@ -41,8 +41,8 @@ pub trait Tool: Send + Sync {
         }
 
         // Check required parameters
-        for required in &schema.required {
-            if !arguments.contains_key(required) {
+        for required in schema.required_names() {
+            if !arguments.contains_key(&required) {
                 return Err(AxiomError::Validation(format!(
                     "Missing required parameter: '{}'",
                     required
@@ -127,6 +127,34 @@ impl ToolParameters {
         self.required.push(name.into());
         self
     }
+
+    /// Names of required parameters, whether marked here or on the parameter itself, sorted
+    pub fn required_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .properties
+            .iter()
+            .filter(|(_, param)| param.required)
+            .map(|(name, _)| name.clone())
+            .chain(self.required.iter().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// JSON Schema for the parameters, in the shape LLM providers expect for tool inputs
+    pub fn to_json_schema(&self) -> serde_json::Value {
+        let properties: serde_json::Map<String, serde_json::Value> = self
+            .properties
+            .iter()
+            .map(|(name, param)| (name.clone(), param.to_json_schema()))
+            .collect();
+        serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": self.required_names(),
+        })
+    }
 }
 
 /// A single parameter definition
@@ -184,6 +212,29 @@ impl ToolParameter {
     pub fn enum_values(mut self, values: Vec<String>) -> Self {
         self.enum_values = Some(values);
         self
+    }
+
+    /// JSON Schema for this parameter
+    pub fn to_json_schema(&self) -> serde_json::Value {
+        let json_type = match self.parameter_type {
+            ParameterType::String | ParameterType::Enum => "string",
+            ParameterType::Integer => "integer",
+            ParameterType::Number => "number",
+            ParameterType::Boolean => "boolean",
+            ParameterType::Array => "array",
+            ParameterType::Object => "object",
+        };
+        let mut schema = serde_json::json!({
+            "type": json_type,
+            "description": self.description,
+        });
+        if let Some(values) = &self.enum_values {
+            schema["enum"] = serde_json::json!(values);
+        }
+        if let Some(default) = &self.default {
+            schema["default"] = default.clone();
+        }
+        schema
     }
 
     /// Validate a value against this parameter
