@@ -370,17 +370,15 @@ impl LLMPlanner {
 
     /// Parse a single step line
     fn parse_step_line(&self, line: &str, step_counter: &mut usize, request: &PlanningRequest) -> Result<PlanStep> {
-        let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-        
-        if parts.len() < 2 {
+        // Format: `STEP: <action> | <params> | <dependencies>`. Only the first and last
+        // pipes are separators, so a `|` inside the parameters (e.g. in a JSON string) survives.
+        let Some((action_part, rest)) = line.split_once('|') else {
             return Err(AxiomError::ChainExecution("Invalid step format".to_string()));
-        }
+        };
+        let action_part = action_part.replace("STEP:", "").trim().to_string();
+        let (params_part, deps_part) = split_params_and_dependencies(rest);
 
-        let action_part = parts[0].replace("STEP:", "").trim().to_string();
-        let params_part = parts[1];
-        let deps_part = if parts.len() > 2 { parts[2] } else { "" };
-
-        let action = self.parse_action(&action_part, params_part, request)?;
+        let action = self.parse_action(&action_part, params_part.trim(), request)?;
         let dependencies = if deps_part.is_empty() {
             Vec::new()
         } else {
@@ -443,6 +441,27 @@ impl LLMPlanner {
                 Err(AxiomError::ChainExecution(format!("Unknown action type: {}", action_type)))
             }
         }
+    }
+}
+
+/// Split the text after a step's action into its parameters and dependency list.
+///
+/// A trailing `|` closes the step and is ignored. The last remaining `|` separates the
+/// dependencies, but only when what follows it looks like a dependency list (step ids
+/// separated by commas, or nothing). Any other text is part of the parameters, so a `|`
+/// inside a JSON argument is not mistaken for a separator.
+fn split_params_and_dependencies(rest: &str) -> (&str, &str) {
+    let trimmed = rest.trim_end();
+    let body = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    match body.rsplit_once('|') {
+        Some((params, deps))
+            if deps
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == ',' || c.is_whitespace()) =>
+        {
+            (params, deps.trim())
+        }
+        _ => (body, ""),
     }
 }
 
@@ -604,6 +623,49 @@ mod tests {
         let calls = tool_calls(&plan);
         assert_eq!(calls[0].1["query"], "rust async traits");
         search.validate_arguments(calls[0].1).unwrap();
+    }
+
+    #[test]
+    fn llm_planner_keeps_pipes_inside_json_arguments() {
+        let search = SearchTool::new(None);
+        let plan = llm_planner()
+            .parse_plan_response(
+                r#"STEP: call_tool | search {"query": "rust | go"} | step_1"#,
+                &request("", &[&search]),
+            )
+            .unwrap();
+
+        let calls = tool_calls(&plan);
+        assert_eq!(calls[0].1["query"], "rust | go");
+        search.validate_arguments(calls[0].1).unwrap();
+        assert_eq!(plan.steps[0].dependencies, vec!["step_1".to_string()]);
+    }
+
+    #[test]
+    fn llm_planner_reads_dependencies_after_the_last_pipe() {
+        let plan = llm_planner()
+            .parse_plan_response("STEP: generate_response | answer | step_1, step_2 |", &request("", &[]))
+            .unwrap();
+
+        assert_eq!(plan.steps[0].dependencies, vec!["step_1".to_string(), "step_2".to_string()]);
+    }
+
+    #[test]
+    fn split_params_and_dependencies_handles_each_layout() {
+        let split = split_params_and_dependencies;
+        assert_eq!(split(" answer"), (" answer", ""));
+        assert_eq!(split(" answer |").0.trim(), "answer");
+        assert_eq!(split(" answer | step_1, step_2"), (" answer ", "step_1, step_2"));
+        assert_eq!(split(" answer | step_1 |").1, "step_1");
+        assert_eq!(split(" answer | |").1, "");
+
+        let json = split(r#" search {"query": "rust | go"} |"#);
+        assert_eq!(json.0.trim(), r#"search {"query": "rust | go"}"#);
+        assert_eq!(json.1, "");
+
+        let json_with_deps = split(r#" search {"query": "rust | go"} | step_1 |"#);
+        assert_eq!(json_with_deps.0.trim(), r#"search {"query": "rust | go"}"#);
+        assert_eq!(json_with_deps.1, "step_1");
     }
 
     #[test]

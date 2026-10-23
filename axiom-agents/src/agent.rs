@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axiom_ai_core::{Memory, Message, Result, StreamResponse, Tool};
+use axiom_ai_core::{Memory, Message, MessageRole, Result, StreamResponse, Tool};
 use axiom_ai_llm::LlmGateway;
 
 use crate::planner::{ExecutionPlan, Planner};
@@ -126,20 +126,39 @@ impl Agent {
         Ok(outcome)
     }
 
-    /// Process a message and return the messages produced by the turn as a stream
+    /// Process a message and stream the assistant's reply.
+    ///
+    /// Tool results, memory notes and safety notices from the turn are not streamed; they
+    /// stay in the outcome of [`process_message`](Self::process_message). The reply is the
+    /// assistant text the turn produced, and only its last chunk is marked final.
     pub async fn process_message_stream(&mut self, message: Message) -> Result<StreamResponse> {
         let outcome = self.process_message(message).await?;
 
-        let chunks = outcome.messages.into_iter().map(|msg| {
-            axiom_ai_core::StreamChunk {
-                content: msg.text_content().unwrap_or("").to_string(),
-                chunk_type: axiom_ai_core::ChunkType::Text,
-                metadata: None,
-                is_final: true,
-            }
-        });
+        let mut replies: Vec<String> = outcome
+            .messages
+            .iter()
+            .filter(|msg| msg.role == MessageRole::Assistant)
+            .filter_map(|msg| msg.text_content().map(str::to_string))
+            .collect();
+        if replies.is_empty() {
+            replies.push(String::new());
+        }
 
-        let stream = tokio_stream::iter(chunks.map(Ok));
+        let last = replies.len() - 1;
+        let chunks: Vec<Result<axiom_ai_core::StreamChunk>> = replies
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| {
+                Ok(axiom_ai_core::StreamChunk {
+                    content,
+                    chunk_type: axiom_ai_core::ChunkType::Text,
+                    metadata: None,
+                    is_final: index == last,
+                })
+            })
+            .collect();
+
+        let stream = tokio_stream::iter(chunks);
         Ok(StreamResponse::new(stream))
     }
 

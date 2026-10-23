@@ -243,6 +243,12 @@ impl<D: Dialect> StreamState<D> {
     /// Produce the next chunk, or `None` once the stream has ended
     async fn next_item(&mut self) -> Option<Result<StreamChunk>> {
         loop {
+            // After a failure or completion, anything still queued is dropped, not yielded
+            if self.finished {
+                self.events.clear();
+                return None;
+            }
+
             if let Some(event) = self.events.pop_front() {
                 match event {
                     StreamEvent::TextDelta(text) => return Some(Ok(text_chunk(text, false))),
@@ -254,10 +260,6 @@ impl<D: Dialect> StreamState<D> {
                     }
                 }
                 continue;
-            }
-
-            if self.finished {
-                return None;
             }
 
             if self.eof {
@@ -409,5 +411,61 @@ mod tests {
         let mut decoder = SseDecoder::default();
         assert!(decoder.push(b"data: last").is_empty());
         assert_eq!(decoder.finish(), vec!["last"]);
+    }
+
+    /// Dialect whose events are the payloads themselves; the payload `bad` is a parse failure
+    #[derive(Default)]
+    struct EchoDialect;
+
+    impl Dialect for EchoDialect {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn description(&self) -> &'static str {
+            "test dialect"
+        }
+        fn default_base_url(&self) -> &'static str {
+            ""
+        }
+        fn endpoint_path(&self) -> &'static str {
+            ""
+        }
+        fn auth_headers(&self, _api_key: Option<&str>) -> Result<HeaderMap> {
+            Ok(HeaderMap::new())
+        }
+        fn build_request_body(&self, _request: &LlmRequest, _stream: bool) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        fn parse_response(&self, _body: &str) -> Result<ParsedCompletion> {
+            Ok(ParsedCompletion::default())
+        }
+        fn parse_stream_event(&self, data: &str) -> Result<Vec<StreamEvent>> {
+            if data == "bad" {
+                Err(AxiomError::LlmProvider("malformed event".to_string()))
+            } else {
+                Ok(vec![StreamEvent::TextDelta(data.to_string())])
+            }
+        }
+        fn models(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn get_cost_per_token(&self, _model: &str) -> Option<f64> {
+            None
+        }
+        fn get_max_context_length(&self, _model: &str) -> Option<usize> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn events_decoded_before_a_failed_event_are_not_yielded_after_the_error() {
+        // One network read carries a good event followed by a malformed one
+        let bytes: ByteStream = Box::pin(stream::iter(vec![Ok(bytes::Bytes::from_static(
+            b"data: good\n\ndata: bad\n\n",
+        ))]));
+        let mut state = StreamState::new(bytes, Arc::new(EchoDialect));
+
+        assert!(matches!(state.next_item().await, Some(Err(AxiomError::LlmProvider(_)))));
+        assert!(state.next_item().await.is_none());
     }
 }

@@ -4,7 +4,7 @@
 //! is either a success or a failure, and token usage is added by the gateway after a
 //! successful generation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const ONE_MINUTE: Duration = Duration::from_secs(60);
@@ -54,10 +54,10 @@ pub struct ProviderMetrics {
     pub avg_response_time_ms: f64,
     /// Last attempt time
     pub last_request_time: Option<Instant>,
-    /// Attempt timestamps from the last hour (for rate calculation)
-    pub request_history: Vec<Instant>,
-    /// Failed attempt timestamps from the last hour (for error rate calculation)
-    pub error_history: Vec<Instant>,
+    /// Attempt timestamps from the last hour, oldest first (for rate calculation)
+    pub request_history: VecDeque<Instant>,
+    /// Failed attempt timestamps from the last hour, oldest first (for error rate calculation)
+    pub error_history: VecDeque<Instant>,
 }
 
 impl LlmMetrics {
@@ -169,8 +169,8 @@ impl ProviderMetrics {
             total_cost: 0.0,
             avg_response_time_ms: 0.0,
             last_request_time: None,
-            request_history: Vec::new(),
-            error_history: Vec::new(),
+            request_history: VecDeque::new(),
+            error_history: VecDeque::new(),
         }
     }
 
@@ -180,15 +180,16 @@ impl ProviderMetrics {
             self.successful_requests += 1;
         } else {
             self.failed_requests += 1;
-            self.error_history.push(now);
+            self.error_history.push_back(now);
         }
         self.avg_response_time_ms = running_average(self.avg_response_time_ms, self.total_requests, latency_ms);
 
         self.last_request_time = Some(now);
-        self.request_history.push(now);
+        self.request_history.push_back(now);
 
-        self.request_history.retain(|&t| now.saturating_duration_since(t) < ONE_HOUR);
-        self.error_history.retain(|&t| now.saturating_duration_since(t) < ONE_HOUR);
+        // Timestamps are pushed in time order, so expired ones are at the front
+        drop_older_than(&mut self.request_history, now, ONE_HOUR);
+        drop_older_than(&mut self.error_history, now, ONE_HOUR);
     }
 
     /// Get success rate
@@ -220,12 +221,17 @@ impl ProviderMetrics {
     }
 }
 
-/// Number of timestamps no older than `window` at `now`
-fn count_within(times: &[Instant], now: Instant, window: Duration) -> usize {
-    times
-        .iter()
-        .filter(|&&t| now.saturating_duration_since(t) < window)
-        .count()
+/// Remove timestamps at least `window` older than `now`. `times` must be oldest first.
+fn drop_older_than(times: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    while times.front().is_some_and(|&t| now.saturating_duration_since(t) >= window) {
+        times.pop_front();
+    }
+}
+
+/// Number of timestamps no older than `window` at `now`. `times` must be oldest first.
+fn count_within(times: &VecDeque<Instant>, now: Instant, window: Duration) -> usize {
+    let expired = times.partition_point(|&t| now.saturating_duration_since(t) >= window);
+    times.len() - expired
 }
 
 /// Incremental mean: folds `sample` into `average`, where `count` is the number of samples including this one

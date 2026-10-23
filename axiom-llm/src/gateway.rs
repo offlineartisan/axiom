@@ -460,7 +460,11 @@ mod tests {
     fn make_gateway(clock: &Arc<FakeClock>) -> LlmGateway {
         LlmGateway::new("a")
             .with_clock(clock.clone())
-            .with_retry_config(RetryConfig::new(3).with_initial_delay(Duration::from_millis(100)))
+            .with_retry_config(
+                RetryConfig::new(3)
+                    .with_initial_delay(Duration::from_millis(100))
+                    .with_jitter_factor(0.0),
+            )
     }
 
     #[tokio::test]
@@ -541,18 +545,22 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_is_checked_before_every_retry_attempt() {
         let clock = Arc::new(FakeClock::new());
-        let rate_limits = RateLimitConfig::new();
+        let rate_limits = RateLimitConfig::unlimited();
+        // One request per minute: the first attempt uses the only permit
         rate_limits.add_limiter("a".to_string(), Some(1), None).await;
         let provider = ScriptedProvider::new("a", vec![Err(unavailable()), Ok(ok_response())]);
         let gateway = make_gateway(&clock)
             .with_rate_limit_config(rate_limits)
             .add_provider("a", provider.clone());
 
-        let err = gateway.generate_with_provider("a", request()).await.unwrap_err();
+        let response = gateway.generate_with_provider("a", request()).await.unwrap();
 
-        // The first attempt used the only permit. Every retry is rejected before reaching the provider.
-        assert_eq!(provider.calls(), 1);
-        assert!(matches!(err, AxiomError::RateLimit(_)));
+        // The retry waited on the limiter, nearly a minute, before reaching the provider again
+        assert_eq!(response.content, "hello");
+        assert_eq!(provider.calls(), 2);
+        let sleeps = clock.sleeps();
+        assert_eq!(sleeps[0], Duration::from_millis(100));
+        assert!(sleeps[1] > Duration::from_secs(59), "limiter wait: {:?}", sleeps[1]);
     }
 
     #[tokio::test]

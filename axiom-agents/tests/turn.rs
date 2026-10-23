@@ -370,3 +370,113 @@ async fn unsafe_generated_response_is_replaced() {
 fn statuses(outcome: &TurnOutcome) -> Vec<StepStatus> {
     outcome.steps.iter().map(|s| s.status.clone()).collect()
 }
+
+#[tokio::test]
+async fn plan_without_a_response_step_still_ends_with_a_reply() {
+    let llm = FakeLlm::new(&["The answer is 42"]);
+    let requests = Arc::clone(&llm.requests);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let steps = vec![step(0, lookup("answer"))];
+    let tool = LookupTool { runs, delay: Duration::ZERO };
+    let mut agent = agent(llm, steps, tool, Box::new(SimpleSafetyGuard::new()), config());
+
+    let outcome = agent
+        .process_message(Message::user("what is the answer?"))
+        .await
+        .unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 1, "the turn asked the LLM for a fallback response");
+    assert_eq!(outcome.messages.last().and_then(|m| m.text_content()), Some("The answer is 42"));
+    assert_eq!(outcome.stop_reason, StopReason::PlanExhausted);
+    assert_eq!(outcome.steps.last().unwrap().step_id, "fallback_response");
+}
+
+#[tokio::test]
+async fn stream_carries_the_reply_and_not_the_tool_output() {
+    let llm = FakeLlm::new(&["The answer is 42"]);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let steps = vec![step(0, lookup("answer")), step(1, generate())];
+    let tool = LookupTool { runs: Arc::clone(&runs), delay: Duration::ZERO };
+    let mut agent = agent(llm, steps, tool, Box::new(SimpleSafetyGuard::new()), config());
+
+    let stream = agent
+        .process_message_stream(Message::user("what is the answer?"))
+        .await
+        .unwrap();
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the tool still ran");
+    assert_eq!(stream.collect_text().await.unwrap(), "The answer is 42");
+}
+
+/// LLM provider that fails its first `failures` calls, then answers "recovered"
+struct FlakyLlm {
+    failures: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for FlakyLlm {
+    fn name(&self) -> &str {
+        "flaky"
+    }
+
+    fn description(&self) -> &str {
+        "Fails a fixed number of times, then answers"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["fake-model".to_string()]
+    }
+
+    async fn generate(&self, _request: LlmRequest) -> Result<LlmResponse> {
+        let failed = self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if failed {
+            return Err(AxiomError::LlmProvider("provider unavailable".to_string()));
+        }
+        Ok(LlmResponse::new("recovered", "fake-model", "flaky"))
+    }
+
+    async fn generate_stream(&self, _request: LlmRequest) -> Result<StreamResponse> {
+        Err(AxiomError::LlmProvider("streaming not used in turn tests".to_string()))
+    }
+
+    fn get_cost_per_token(&self, _model: &str) -> Option<f64> {
+        None
+    }
+
+    fn get_max_context_length(&self, _model: &str) -> Option<usize> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn failed_turn_leaves_the_conversation_as_it_was_so_the_message_can_be_retried() {
+    let llm = Arc::new(
+        LlmGateway::new("flaky")
+            .add_provider("flaky", Arc::new(FlakyLlm { failures: AtomicUsize::new(1) }))
+            .with_retry_config(RetryConfig::new(0))
+            .with_rate_limit_config(RateLimitConfig::new().with_default_limits(Some(10_000), None)),
+    );
+    let mut agent = Agent::new(
+        llm,
+        Box::new(InMemoryMemory::new()),
+        Box::new(ScriptedPlanner { steps: vec![step(0, generate())] }),
+        Box::new(SimpleSafetyGuard::new()),
+        config(),
+    );
+
+    assert!(agent.process_message(Message::user("hello")).await.is_err());
+    assert!(agent.get_state().conversation.is_empty(), "a failed turn leaves no messages behind");
+
+    let outcome = agent.process_message(Message::user("hello")).await.unwrap();
+    assert_eq!(outcome.messages.last().and_then(|m| m.text_content()), Some("recovered"));
+    let users = agent
+        .get_state()
+        .conversation
+        .iter()
+        .filter(|m| m.role == MessageRole::User)
+        .count();
+    assert_eq!(users, 1, "the retried message is recorded once");
+}

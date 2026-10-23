@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -15,11 +16,13 @@ use crate::retry::RetryConfig;
 
 /// Runs provider operations with the rate limit, retry policy and metrics applied to every attempt.
 ///
-/// For each attempt, [`call`](Self::call):
-/// 1. acquires the provider's rate limit (a rejection counts as a failed attempt),
+/// [`call`](Self::call) loops over attempts:
+/// 1. acquires the provider's rate limit. A rejection means the request never reached the
+///    provider, so the call waits the limiter's hint on the [`Clock`] and tries again. It is
+///    not recorded in [`LlmMetrics`] and does not use up a retry.
 /// 2. runs the operation, bounded by the attempt timeout,
 /// 3. records the success or failure in [`LlmMetrics`],
-/// 4. if the error is retryable and retries remain, waits the backoff on the [`Clock`] and tries again.
+/// 4. if the error is retryable and retries remain, waits the jittered backoff on the [`Clock`] and tries again.
 pub struct ResilientCall {
     retry: RetryConfig,
     rate_limits: RateLimitConfig,
@@ -61,15 +64,22 @@ impl ResilientCall {
     {
         let mut retries_used = 0;
         loop {
-            let started = self.clock.now();
-            let outcome = match self
+            if let Err(wait) = self
                 .rate_limits
-                .check_rate_limit_with_tokens(provider, started, tokens)
+                .acquire(provider, self.clock.now(), tokens)
                 .await
             {
-                Ok(()) => self.attempt(&mut op).await,
-                Err(rejected) => Err(rejected),
-            };
+                if wait == Duration::MAX {
+                    return Err(AxiomError::RateLimit(format!(
+                        "Rate limit for provider '{provider}' never refills"
+                    )));
+                }
+                self.clock.sleep(wait).await;
+                continue;
+            }
+
+            let started = self.clock.now();
+            let outcome = self.attempt(&mut op).await;
             let latency = self.clock.now().saturating_duration_since(started);
 
             match outcome {
@@ -84,7 +94,8 @@ impl ResilientCall {
                         return Err(error);
                     }
 
-                    self.clock.sleep(self.retry.backoff_for(retries_used)).await;
+                    let delay = self.retry.delay_for(retries_used, rand::random::<f64>());
+                    self.clock.sleep(delay).await;
                     retries_used += 1;
                 }
             }
@@ -141,9 +152,11 @@ mod tests {
         AxiomError::from(err)
     }
 
-    /// Retry policy with a 100 ms first backoff so schedules are easy to read
+    /// Retry policy with a 100 ms first backoff and no jitter, so schedules are exact
     fn quick_retries(max_retries: u32) -> RetryConfig {
-        RetryConfig::new(max_retries).with_initial_delay(Duration::from_millis(100))
+        RetryConfig::new(max_retries)
+            .with_initial_delay(Duration::from_millis(100))
+            .with_jitter_factor(0.0)
     }
 
     fn call_with(clock: &Arc<FakeClock>, retry: RetryConfig) -> ResilientCall {
@@ -237,10 +250,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_attempt_consumes_rate_limit_capacity() {
+    async fn rejected_attempts_wait_for_the_limiter_without_using_a_retry() {
         let clock = Arc::new(FakeClock::new());
-        let rate_limits = RateLimitConfig::new();
-        // Two requests per minute. Retry attempts share that budget with the first attempt.
+        let rate_limits = RateLimitConfig::unlimited();
+        // Two requests per minute, so a new token arrives every 30 seconds
         rate_limits.add_limiter("p".to_string(), Some(2), None).await;
         let call = call_with(&clock, quick_retries(3)).with_rate_limit_config(rate_limits);
         let calls = AtomicU32::new(0);
@@ -252,12 +265,41 @@ mod tests {
             })
             .await;
 
-        // Attempts 1 and 2 reach the operation. Attempts 3 and 4 are rejected by the limiter.
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(matches!(result, Err(AxiomError::RateLimit(_))));
+        // Three retries on the backoff schedule, with the limiter's waits in between
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(matches!(result, Err(AxiomError::ProviderUnavailable(_))));
 
+        let sleeps = clock.sleeps();
+        assert_eq!(sleeps.len(), 5, "three backoffs and two limiter waits: {sleeps:?}");
+        assert_eq!(sleeps[0], Duration::from_millis(100));
+        assert_eq!(sleeps[1], Duration::from_millis(200));
+        assert!(sleeps[2] > Duration::from_secs(29), "limiter wait: {:?}", sleeps[2]);
+        assert_eq!(sleeps[3], Duration::from_millis(400));
+        assert!(sleeps[4] > Duration::from_secs(29), "limiter wait: {:?}", sleeps[4]);
+
+        // Only the four attempts that reached the provider are counted
         let metrics = call.metrics().read().await;
         assert_eq!(metrics.get_provider_metrics("p").unwrap().total_requests, 4);
+    }
+
+    #[tokio::test]
+    async fn limiter_that_never_refills_fails_without_waiting() {
+        let clock = Arc::new(FakeClock::new());
+        let rate_limits = RateLimitConfig::unlimited();
+        rate_limits.add_limiter("p".to_string(), Some(0), None).await;
+        let call = call_with(&clock, quick_retries(3)).with_rate_limit_config(rate_limits);
+        let calls = AtomicU32::new(0);
+
+        let result: Result<()> = call
+            .call("p", 0, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            })
+            .await;
+
+        assert!(matches!(result, Err(AxiomError::RateLimit(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(clock.sleeps().is_empty());
     }
 
     #[tokio::test]
@@ -283,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn unlimited_rate_limit_does_not_panic_after_time_advances() {
         let clock = Arc::new(FakeClock::new());
-        let call = call_with(&clock, quick_retries(0));
+        let call = call_with(&clock, quick_retries(0)).with_rate_limit_config(RateLimitConfig::unlimited());
 
         for _ in 0..3 {
             clock.advance(Duration::from_secs(24 * 3600));

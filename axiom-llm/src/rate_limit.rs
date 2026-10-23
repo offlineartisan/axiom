@@ -1,8 +1,10 @@
 //! Rate limiting implementation
 //!
-//! Limits are per provider. A provider with no configured limit is not limited at all:
-//! there is no implicit default. Time is passed in explicitly (usually from a
-//! [`Clock`](crate::clock::Clock)) so tests can drive it deterministically.
+//! Limits are per provider. A provider without an explicit limiter gets the configuration's
+//! default limits, which are 60 requests and 10,000 tokens per minute unless changed with
+//! [`RateLimitConfig::with_default_limits`] or [`RateLimitConfig::unlimited`]. Time is passed
+//! in explicitly (usually from a [`Clock`](crate::clock::Clock)) so tests can drive it
+//! deterministically.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,13 +169,18 @@ pub struct RateLimitConfig {
 }
 
 impl RateLimitConfig {
-    /// Create a configuration with no limits: every provider is unlimited until one is configured
+    /// Create a configuration with the default limits of 60 requests and 10,000 tokens per minute
     pub fn new() -> Self {
         Self {
             limiters: Arc::new(RwLock::new(HashMap::new())),
-            default_requests_per_minute: None,
-            default_tokens_per_minute: None,
+            default_requests_per_minute: Some(60),
+            default_tokens_per_minute: Some(10_000),
         }
+    }
+
+    /// Create a configuration with no limits, for providers that should never be throttled
+    pub fn unlimited() -> Self {
+        Self::new().with_default_limits(None, None)
     }
 
     /// Set the limits applied to providers without an explicit limiter
@@ -213,6 +220,23 @@ impl RateLimitConfig {
         now: Instant,
         token_count: u32,
     ) -> Result<()> {
+        self.acquire(provider_name, now, token_count).await.map_err(|wait| {
+            AxiomError::RateLimit(format!(
+                "Rate limit exceeded for provider '{}' with {} tokens. Try again in {:?}",
+                provider_name, token_count, wait
+            ))
+        })
+    }
+
+    /// Admit one request using `token_count` tokens at `now`. On rejection, returns how long to wait.
+    ///
+    /// `Duration::MAX` means the limit never refills, so waiting cannot help.
+    pub async fn acquire(
+        &self,
+        provider_name: &str,
+        now: Instant,
+        token_count: u32,
+    ) -> std::result::Result<(), Duration> {
         let mut limiters = self.limiters.write().await;
 
         if !limiters.contains_key(provider_name) {
@@ -227,12 +251,7 @@ impl RateLimitConfig {
         }
 
         match limiters.get_mut(provider_name) {
-            Some(limiter) => limiter.try_acquire(now, token_count).map_err(|wait| {
-                AxiomError::RateLimit(format!(
-                    "Rate limit exceeded for provider '{}' with {} tokens. Try again in {:?}",
-                    provider_name, token_count, wait
-                ))
-            }),
+            Some(limiter) => limiter.try_acquire(now, token_count),
             None => Ok(()),
         }
     }
@@ -343,17 +362,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_configured_providers_are_limited() {
+    async fn new_config_limits_providers_to_the_default_per_minute_limits() {
+        let clock = FakeClock::new();
+        let config = RateLimitConfig::new();
+        for _ in 0..60 {
+            assert!(config.check_rate_limit("p", clock.now()).await.is_ok());
+        }
+        assert!(config.check_rate_limit("p", clock.now()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_limiters_override_the_defaults() {
         let clock = FakeClock::new();
         let config = RateLimitConfig::new();
         config.add_limiter("limited".to_string(), Some(1), None).await;
 
-        // No limiter and no defaults: unlimited.
-        assert!(config.check_rate_limit("unconfigured", clock.now()).await.is_ok());
-        assert!(config.check_rate_limit("unconfigured", clock.now()).await.is_ok());
-
         assert!(config.check_rate_limit("limited", clock.now()).await.is_ok());
         assert!(config.check_rate_limit("limited", clock.now()).await.is_err());
+
+        // Other providers keep the default limit
+        for _ in 0..60 {
+            assert!(config.check_rate_limit("other", clock.now()).await.is_ok());
+        }
+        assert!(config.check_rate_limit("other", clock.now()).await.is_err());
     }
 
     #[tokio::test]
@@ -366,9 +397,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acquire_reports_how_long_to_wait_when_rejected() {
+        let clock = FakeClock::new();
+        let config = RateLimitConfig::unlimited();
+        // One request per minute: the next token arrives after 60 seconds
+        config.add_limiter("p".to_string(), Some(1), None).await;
+
+        assert!(config.acquire("p", clock.now(), 0).await.is_ok());
+        let wait = config.acquire("p", clock.now(), 0).await.unwrap_err();
+        assert_eq!(wait, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
     async fn unlimited_config_does_not_panic_after_time_advances() {
         let clock = FakeClock::new();
-        let config = RateLimitConfig::new();
+        let config = RateLimitConfig::unlimited();
 
         clock.advance(Duration::from_secs(7 * 24 * 3600));
         assert!(config

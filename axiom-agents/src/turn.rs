@@ -3,7 +3,8 @@
 //! [`run_turn`] is the only code that dispatches plan steps. For each step it
 //! checks safety, dispatches (tool call, memory read or write, or LLM response),
 //! and appends the step's result messages to the conversation before the next
-//! step runs. The turn stops when a response is generated or the plan runs out.
+//! step runs. The turn stops when a response is generated; if the plan runs out
+//! first, the turn generates one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,13 +111,16 @@ pub struct SafetyVerdict {
 /// Why a turn stopped
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// The plan has no more steps
+    /// The plan ran out without a response step, and the turn answered with a fallback response
     PlanExhausted,
     /// A response was generated and the turn ended
     ResponseGenerated,
     /// The generated response failed the safety check and was replaced
     ResponseBlocked,
 }
+
+/// Step id recorded when a plan has no response step and the turn answers anyway
+const FALLBACK_STEP_ID: &str = "fallback_response";
 
 /// Run one turn for `incoming`.
 ///
@@ -125,8 +129,14 @@ pub enum StopReason {
 /// `conversation` before the next step runs, so later steps and the final LLM call
 /// see tool outputs and retrieved memories.
 ///
+/// Every turn that succeeds ends with an assistant message. If the plan runs out
+/// without a response step, the turn generates one from the conversation.
+///
 /// Errors are returned only when a collaborator fails (planner, memory, LLM gateway,
 /// safety guard). Tool failures, timeouts and rejections are recorded in the outcome.
+/// On error, `conversation` is restored to its length before the call and the
+/// incoming query is removed from memory, so the same message can be retried cleanly.
+/// Memory writes made by plan steps before the failure are not undone.
 pub async fn run_turn(
     mut deps: TurnDeps<'_>,
     conversation: &mut Vec<Message>,
@@ -134,13 +144,32 @@ pub async fn run_turn(
 ) -> Result<TurnOutcome> {
     let started = Instant::now();
     let query = incoming.text_content().unwrap_or_default().to_string();
+    let conversation_len = conversation.len();
 
-    deps.memory
-        .store(MemoryItem::new(query.clone(), MemoryType::ShortTerm, 0.5))
-        .await?;
+    let stored = MemoryItem::new(query.clone(), MemoryType::ShortTerm, 0.5);
+    let stored_id = stored.id;
+    deps.memory.store(stored).await?;
     conversation.push(incoming);
 
-    let context = deps.memory.retrieve(&query, Some(10)).await?;
+    match run_plan(&mut deps, conversation, &query, started).await {
+        Ok(outcome) => Ok(outcome),
+        Err(err) => {
+            conversation.truncate(conversation_len);
+            // Best effort: the error being returned is the one that matters to the caller.
+            let _ = deps.memory.delete(stored_id).await;
+            Err(err)
+        }
+    }
+}
+
+/// Plan the turn and run its steps; the body of [`run_turn`] after the incoming message is recorded
+async fn run_plan(
+    deps: &mut TurnDeps<'_>,
+    conversation: &mut Vec<Message>,
+    query: &str,
+    started: Instant,
+) -> Result<TurnOutcome> {
+    let context = deps.memory.retrieve(query, Some(10)).await?;
     let plan = deps
         .planner
         .create_plan(PlanningRequest {
@@ -158,7 +187,7 @@ pub async fn run_turn(
     let mut stop_reason = StopReason::PlanExhausted;
 
     for step in &plan.steps {
-        let output = dispatch(&mut deps, conversation.as_slice(), tool_calls.len(), step).await?;
+        let output = dispatch(deps, conversation.as_slice(), tool_calls.len(), step).await?;
 
         conversation.extend(output.messages.iter().cloned());
         messages.extend(output.messages);
@@ -172,6 +201,21 @@ pub async fn run_turn(
         if let Some(reason) = output.stop {
             stop_reason = reason;
             break;
+        }
+    }
+
+    if stop_reason == StopReason::PlanExhausted {
+        // No response step ran, so answer from the conversation as it now stands
+        let output = generate_response(deps, conversation.as_slice()).await?;
+        conversation.extend(output.messages.iter().cloned());
+        messages.extend(output.messages);
+        steps.push(StepRecord {
+            step_id: FALLBACK_STEP_ID.to_string(),
+            status: output.status.clone(),
+        });
+        safety_verdicts.extend(output.verdicts);
+        if output.status != StepStatus::Completed {
+            stop_reason = StopReason::ResponseBlocked;
         }
     }
 

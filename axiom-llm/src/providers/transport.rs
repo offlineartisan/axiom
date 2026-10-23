@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::{stream, Stream, StreamExt};
 use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
 
@@ -49,8 +49,9 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     /// Create a transport from a provider configuration.
     ///
-    /// `timeout_seconds` bounds connection setup and, for non-streaming requests,
-    /// the whole request. Streaming responses are not cut off by the total timeout.
+    /// `timeout_seconds` bounds connection setup. For non-streaming requests it also bounds the
+    /// whole request. For streaming responses it bounds the silence between chunks, so a stream
+    /// that stops sending fails instead of hanging.
     pub fn new(config: &ProviderConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder();
         if let Some(seconds) = config.timeout_seconds {
@@ -93,9 +94,35 @@ impl HttpTransport for ReqwestTransport {
     ) -> Result<(StatusCode, ByteStream)> {
         let response = self.client.post(url).headers(headers).json(body).send().await?;
         let status = response.status();
-        let stream = response.bytes_stream().map(|chunk| chunk.map_err(AxiomError::from));
-        Ok((status, Box::pin(stream)))
+        let stream = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(AxiomError::from))
+            .boxed();
+        let stream = match self.timeout {
+            Some(idle) => with_idle_timeout(stream, idle),
+            None => stream,
+        };
+        Ok((status, stream))
     }
+}
+
+/// Fail a byte stream that goes quiet for longer than `idle`.
+///
+/// Each wait for the next chunk is bounded. On timeout the stream yields a
+/// [`AxiomError::Timeout`] and then ends.
+fn with_idle_timeout(stream: ByteStream, idle: Duration) -> ByteStream {
+    let bounded = stream::unfold(Some(stream), move |state| async move {
+        let mut stream = state?;
+        match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(item)) => Some((item, Some(stream))),
+            Ok(None) => None,
+            Err(_elapsed) => Some((
+                Err(AxiomError::Timeout(format!("No data received for {idle:?}"))),
+                None,
+            )),
+        }
+    });
+    Box::pin(bounded)
 }
 
 /// Read a byte stream to completion and decode it as UTF-8 (lossily)
@@ -105,4 +132,20 @@ pub async fn collect_text(mut bytes: ByteStream) -> Result<String> {
         buffer.extend_from_slice(&chunk?);
     }
     Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn quiet_stream_fails_after_the_idle_period() {
+        let chunks = stream::iter(vec![Ok::<Bytes, AxiomError>(Bytes::from_static(b"hi"))])
+            .chain(stream::pending());
+        let mut bounded = with_idle_timeout(Box::pin(chunks), Duration::from_millis(20));
+
+        assert_eq!(bounded.next().await.unwrap().unwrap(), Bytes::from_static(b"hi"));
+        assert!(matches!(bounded.next().await, Some(Err(AxiomError::Timeout(_)))));
+        assert!(bounded.next().await.is_none());
+    }
 }
